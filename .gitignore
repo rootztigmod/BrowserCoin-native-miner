@@ -5,6 +5,8 @@ dist
 .DS_Store
 .env
 .env.local
+*.key
+miner.env
 server/dist
 server/chain.json
 server/chain-*.json
@@ -12,3 +14,5 @@ server/helpers-*.json
 server/backups-*/
 .claude
 *.stackdump
+
+native/target/

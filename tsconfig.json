@@ -19,8 +19,8 @@
     "resolveJsonModule": true,
     "useDefineForClassFields": true,
     "verbatimModuleSyntax": false,
-    "types": ["vite/client"]
+    "types": ["node", "vite/client"]
   },
-  "include": ["src/**/*", "server/**/*"],
+  "include": ["src/**/*", "server/**/*", "tools/**/*"],
   "exclude": ["node_modules", "dist"]
 }

@@ -1,0 +1,24 @@
+[Unit]
+Description=BrowserCoin headless miner
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=simple
+User=browsercoin
+Group=browsercoin
+WorkingDirectory=/opt/browsercoin
+EnvironmentFile=/etc/browsercoin/miner.env
+Environment=SANDGLASS_HUGEPAGE=1
+ExecStart=/usr/bin/npm run mine:headless -- --key-file ${BRC_KEY_FILE} --workers ${BRC_WORKERS} --nonce-offset ${BRC_NONCE_OFFSET} --nonce-stride ${BRC_NONCE_STRIDE}
+Restart=always
+RestartSec=15
+TimeoutStopSec=30
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectHome=true
+ProtectSystem=strict
+ReadWritePaths=/var/lib/browsercoin
+
+[Install]
+WantedBy=multi-user.target

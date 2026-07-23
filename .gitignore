@@ -16,3 +16,5 @@ server/backups-*/
 *.stackdump
 
 native/target/
+release/
+tools/standalone-assets/*.asset

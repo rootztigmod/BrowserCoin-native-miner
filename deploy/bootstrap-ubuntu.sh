@@ -44,5 +44,6 @@ npm ci
 npm run build
 
 install -d -m 0755 /etc/browsercoin
+install -m 0755 deploy/browsercoin-miner /usr/local/bin/browsercoin-miner
 install -m 0644 deploy/browsercoin-miner.service /etc/systemd/system/browsercoin-miner.service
 systemctl daemon-reload

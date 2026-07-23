@@ -10,7 +10,7 @@ Group=browsercoin
 WorkingDirectory=/opt/browsercoin
 EnvironmentFile=/etc/browsercoin/miner.env
 Environment=SANDGLASS_HUGEPAGE=1
-ExecStart=/usr/bin/npm run mine:headless -- --key-file ${BRC_KEY_FILE} --workers ${BRC_WORKERS} --nonce-offset ${BRC_NONCE_OFFSET} --nonce-stride ${BRC_NONCE_STRIDE}
+ExecStart=/usr/local/bin/browsercoin-miner --key-file ${BRC_KEY_FILE} --workers ${BRC_WORKERS} --nonce-offset ${BRC_NONCE_OFFSET} --nonce-stride ${BRC_NONCE_STRIDE}
 Restart=always
 RestartSec=15
 TimeoutStopSec=30

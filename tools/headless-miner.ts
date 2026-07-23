@@ -6,8 +6,8 @@
  * changes when run from a pinned BrowserCoin checkout.
  *
  * Usage:
- *   npm run mine:headless -- --key-file /etc/browsercoin/miner.key --workers 4
- *   npm run mine:headless -- --generate-key /etc/browsercoin/miner.key
+ *   browsercoin-miner --key-file /path/to/miner.key --workers 4
+ *   browsercoin-miner --generate-key /path/to/miner.key
  */
 import { readFile, writeFile, chmod, mkdir } from 'node:fs/promises';
 import { dirname } from 'node:path';
@@ -30,6 +30,13 @@ const DEFAULT_HELPERS = ['https://api1.browsercoin.org', 'https://api2.browserco
 const SYNC_INTERVAL_MS = 10_000;
 const REQUEST_TIMEOUT_MS = 12_000;
 const MAX_NATIVE_TEMPLATE_AGE_S = 60;
+export const MINER_VERSION = '0.2.0';
+
+export interface MinerRuntime {
+  nativeMinerPath?: string;
+  jsWorkerPath?: string;
+  standalone?: boolean;
+}
 
 interface Options {
   helpers: string[];
@@ -58,13 +65,12 @@ interface Tip {
   tipHash: string;
 }
 
-void main().catch((error: unknown) => {
-  console.error(`[miner] fatal: ${error instanceof Error ? error.message : String(error)}`);
-  process.exitCode = 1;
-});
-
-async function main(): Promise<void> {
-  const options = parseOptions(process.argv.slice(2));
+export async function runMiner(args = process.argv.slice(2), runtime: MinerRuntime = {}): Promise<void> {
+  if (args.length === 1 && args[0] === '--version') {
+    console.log(`browsercoin-miner ${MINER_VERSION}${runtime.standalone ? ' (standalone)' : ''}`);
+    return;
+  }
+  const options = parseOptions(args);
   if (options.generateKey) {
     await generateAndStoreKey(options.generateKey);
     return;
@@ -89,7 +95,7 @@ async function main(): Promise<void> {
   let nativeJobId = 0;
   let nativeJobHandler: ((event: NativeMinerEvent) => void) | undefined;
   const nativeMiner = options.engine === 'native'
-    ? new NativeMiner(options.workers, (event) => nativeJobHandler?.(event))
+    ? new NativeMiner(options.workers, (event) => nativeJobHandler?.(event), runtime.nativeMinerPath)
     : undefined;
   if (nativeMiner) {
     await nativeMiner.start();
@@ -151,7 +157,7 @@ async function main(): Promise<void> {
         return;
       }
       const responses = await submitBlock(block, options.helpers);
-      console.log(`[miner] solved height=${block.header.height}; ${responses.join('; ')}`);
+      logSolved(`[miner] solved height=${block.header.height}; ${responses.join('; ')}`);
     };
 
     if (nativeMiner) {
@@ -184,7 +190,7 @@ async function main(): Promise<void> {
       });
     } else {
       activeWorkers = Array.from({ length: options.workers }, (_, index) => {
-        const worker = new Worker(new URL('./dist/headless-miner.worker.mjs', import.meta.url), {
+        const worker = new Worker(runtime.jsWorkerPath ?? new URL('./dist/headless-miner.worker.mjs', import.meta.url), {
           workerData: {
             headerHex: bytesToHex(encodeHeader(candidate.block.header)),
             targetHex: candidate.targetHex,
@@ -393,8 +399,8 @@ function parseOptions(args: string[]): Options {
     }
     else if (value === '--helper' && next) { options.helpers.push(next.replace(/\/$/, '')); index++; }
     else if (value === '--help') {
-      console.log('Usage: npm run mine:headless -- --key-file PATH [--engine native|js] [--workers N] [--nonce-offset N] [--nonce-stride N] [--helper URL]');
-      console.log('       npm run mine:headless -- --generate-key PATH');
+      console.log('Usage: browsercoin-miner --key-file PATH [--engine native|js] [--workers N] [--nonce-offset N] [--nonce-stride N] [--helper URL]');
+      console.log('       browsercoin-miner --generate-key PATH');
       process.exit(0);
     } else throw new Error(`unknown or incomplete option: ${value}`);
   }
@@ -437,6 +443,13 @@ function nonceInteger(value: string, name: string, allowZero = false): number {
     throw new Error(`${name} must be an integer between ${allowZero ? 0 : 1} and 4294967296`);
   }
   return parsed;
+}
+
+function logSolved(message: string): void {
+  // Keep journal output clean when launched by systemd, while making a locally
+  // launched miner's successful solve conspicuous in an interactive terminal.
+  if (process.stdout.isTTY) console.log(`\x1b[1;32m${message}\x1b[0m`);
+  else console.log(message);
 }
 
 function sleep(ms: number): Promise<void> {

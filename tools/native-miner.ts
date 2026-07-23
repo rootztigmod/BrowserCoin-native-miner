@@ -25,11 +25,13 @@ export class NativeMiner {
   constructor(
     private readonly workers: number,
     private readonly onEvent: (event: NativeMinerEvent) => void,
+    private readonly executablePath?: string,
   ) {}
 
   async start(): Promise<void> {
     if (this.ready) return this.ready;
-    const executable = process.env.BRC_NATIVE_MINER
+    const executable = this.executablePath
+      ?? process.env.BRC_NATIVE_MINER
       ?? fileURLToPath(new URL('../native/target/release/browsercoin-native-miner', import.meta.url));
     await access(executable).catch(() => {
       throw new Error(`native miner not found at ${executable}; run npm run build:native-miner or explicitly pass --engine js`);

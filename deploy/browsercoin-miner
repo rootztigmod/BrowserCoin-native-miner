@@ -1,0 +1,14 @@
+#!/usr/bin/env bash
+# Run BrowserCoin mining interactively. The private key stays in a mode-0600
+# file; never place its hex contents directly on a command line.
+set -euo pipefail
+
+readonly app_dir="/opt/browsercoin"
+readonly runner="$app_dir/node_modules/.bin/tsx"
+
+if [[ ! -x "$runner" ]]; then
+  printf 'BrowserCoin miner is not installed at %s. Run deploy/install-local-source.sh first.\n' "$app_dir" >&2
+  exit 1
+fi
+
+exec "$runner" "$app_dir/tools/headless-miner-cli.ts" "$@"

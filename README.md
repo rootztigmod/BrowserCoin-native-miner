@@ -66,6 +66,55 @@ Open the URL. You'll get an auto-generated wallet, hit **Start mining** on the M
 
 The two helpers run as independent processes — kill one and the other keeps working. Either is optional: once two browsers have formed a direct WebRTC connection they keep gossiping even if both helpers die. Helper discovery is layered like Bitcoin's cached peers, seed discovery, and address gossip: bootstrap sources help find the network, but local validation decides chain validity.
 
+## Standalone Linux miner
+
+The release artifact is one Linux x86_64 executable. It includes the native
+Sandglass worker and does not require Node.js, npm, Rust, Docker, or systemd.
+
+Download a published `miner-v*` release and verify its checksum before running
+it:
+
+```bash
+VERSION=miner-v0.2.0 # replace with the release tag
+BASE="https://github.com/rootztigmod/BrowserCoin-native-miner/releases/download/$VERSION"
+curl -fLO "$BASE/browsercoin-miner-linux-x64"
+curl -fLO "$BASE/browsercoin-miner-linux-x64.sha256"
+sha256sum -c browsercoin-miner-linux-x64.sha256
+chmod 755 browsercoin-miner-linux-x64
+```
+
+Generate a fresh key once, then back up that file securely:
+
+```bash
+./browsercoin-miner-linux-x64 --generate-key "$HOME/.browsercoin/miner.key"
+```
+
+Start mining in the foreground. The miner prints live hashrate to the terminal;
+a successfully found and submitted block is highlighted green:
+
+```bash
+./browsercoin-miner-linux-x64 \
+  --key-file "$HOME/.browsercoin/miner.key" \
+  --workers 16
+```
+
+Use the same key file on multiple machines only with non-overlapping nonce
+lanes. For example, two 16-worker miners can use:
+
+```bash
+# machine one
+./browsercoin-miner-linux-x64 --key-file "$HOME/.browsercoin/miner.key" \
+  --workers 16 --nonce-offset 0 --nonce-stride 32
+
+# machine two
+./browsercoin-miner-linux-x64 --key-file "$HOME/.browsercoin/miner.key" \
+  --workers 16 --nonce-offset 16 --nonce-stride 32
+```
+
+Run `./browsercoin-miner-linux-x64 --help` for helpers, engine selection, and
+other options. Do not put the private-key hex directly on the command line:
+shell history and process listings can expose it.
+
 ## Scripts
 
 | Script | Description |

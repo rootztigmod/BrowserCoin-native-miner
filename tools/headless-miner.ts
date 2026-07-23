@@ -6,7 +6,7 @@
  * changes when run from a pinned BrowserCoin checkout.
  *
  * Usage:
- *   browsercoin-miner --key-file /path/to/miner.key --workers 4
+ *   browsercoin-miner --address YOUR_64_HEX_WALLET_ADDRESS --workers 4
  *   browsercoin-miner --generate-key /path/to/miner.key
  */
 import { readFile, writeFile, chmod, mkdir } from 'node:fs/promises';
@@ -21,7 +21,7 @@ import { MAX_BLOCK_BYTES, SANDGLASS_FORK_HEIGHT } from '../src/chain/genesis.js'
 import { Mempool } from '../src/chain/mempool.js';
 import { applyBlockTxs, cloneState, stateRoot } from '../src/chain/state.js';
 import { decodeTx, type Transaction } from '../src/chain/transaction.js';
-import { fromPrivateKey, generateKeyPair } from '../src/crypto/keys.js';
+import { addressFromHex, fromPrivateKey, generateKeyPair } from '../src/crypto/keys.js';
 import { attemptFastSync, fastSyncEligible } from '../src/net/fastSync.js';
 import { compactToTarget, bytesToHex, hexToBytes } from '../src/util/binary.js';
 import { NativeMiner, type NativeMinerEvent } from './native-miner.js';
@@ -40,6 +40,7 @@ export interface MinerRuntime {
 
 interface Options {
   helpers: string[];
+  address?: string;
   keyFile?: string;
   generateKey?: string;
   workers: number;
@@ -75,10 +76,18 @@ export async function runMiner(args = process.argv.slice(2), runtime: MinerRunti
     await generateAndStoreKey(options.generateKey);
     return;
   }
-  if (!options.keyFile) throw new Error('pass --key-file PATH, or use --generate-key PATH once');
+  if (!options.address && !options.keyFile) {
+    throw new Error('pass --address YOUR_64_HEX_WALLET_ADDRESS (recommended), or --key-file PATH for legacy use');
+  }
+  if (options.address && options.keyFile) throw new Error('pass either --address or --key-file, not both');
 
-  const key = fromPrivateKey(await loadPrivateKey(options.keyFile));
-  console.log(`[miner] address=${key.address}`);
+  // Mining needs only the public address written into the coinbase. Retain
+  // --key-file solely for existing installations that derive that address
+  // locally; never require a private key on a remote mining host.
+  const miner = options.address
+    ? parseAddress(options.address)
+    : fromPrivateKey(await loadPrivateKey(options.keyFile!)).publicKey;
+  console.log(`[miner] address=${bytesToHex(miner)}`);
   console.log(
     `[miner] engine=${options.engine}; workers=${options.workers}; nonce lanes=${options.nonceOffset}-${options.nonceOffset + options.workers - 1} ` +
     `mod ${options.nonceStride}; helpers=${options.helpers.join(',')}`,
@@ -123,7 +132,7 @@ export async function runMiner(args = process.argv.slice(2), runtime: MinerRunti
 
   let activeNativeCandidate: Candidate | undefined;
   while (!stopping) {
-    const candidate = buildCandidate(chain, mempool, key.publicKey);
+    const candidate = buildCandidate(chain, mempool, miner);
     if (nativeMiner && candidate.block.header.height < SANDGLASS_FORK_HEIGHT) {
       throw new Error(`native engine supports Sandglass blocks at height ${SANDGLASS_FORK_HEIGHT} and above; pass --engine js for historical mining`);
     }
@@ -387,7 +396,8 @@ function parseOptions(args: string[]): Options {
   for (let index = 0; index < args.length; index++) {
     const value = args[index];
     const next = args[index + 1];
-    if (value === '--key-file' && next) { options.keyFile = next; index++; }
+    if (value === '--address' && next) { options.address = next; index++; }
+    else if (value === '--key-file' && next) { options.keyFile = next; index++; }
     else if (value === '--generate-key' && next) { options.generateKey = next; index++; }
     else if (value === '--workers' && next) { options.workers = positiveInt(next, '--workers'); index++; }
     else if (value === '--engine' && next && (next === 'native' || next === 'js')) { options.engine = next; index++; }
@@ -399,7 +409,8 @@ function parseOptions(args: string[]): Options {
     }
     else if (value === '--helper' && next) { options.helpers.push(next.replace(/\/$/, '')); index++; }
     else if (value === '--help') {
-      console.log('Usage: browsercoin-miner --key-file PATH [--engine native|js] [--workers N] [--nonce-offset N] [--nonce-stride N] [--helper URL]');
+      console.log('Usage: browsercoin-miner --address ADDRESS [--engine native|js] [--workers N] [--nonce-offset N] [--nonce-stride N] [--helper URL]');
+      console.log('       browsercoin-miner --key-file PATH [options]  # legacy; exposes a private key to this host');
       console.log('       browsercoin-miner --generate-key PATH');
       process.exit(0);
     } else throw new Error(`unknown or incomplete option: ${value}`);
@@ -429,6 +440,13 @@ async function loadPrivateKey(path: string): Promise<Uint8Array> {
   const encoded = (await readFile(path, 'utf8')).trim();
   if (!/^[0-9a-f]{64}$/i.test(encoded)) throw new Error('key file must contain exactly 32 bytes as 64 hex characters');
   return hexToBytes(encoded);
+}
+
+function parseAddress(value: string): Uint8Array {
+  if (!/^[0-9a-f]{64}$/i.test(value)) {
+    throw new Error('--address must be exactly 32 bytes as 64 hexadecimal characters');
+  }
+  return addressFromHex(value);
 }
 
 function positiveInt(value: string, name: string): number {

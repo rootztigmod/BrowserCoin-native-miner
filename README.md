@@ -83,10 +83,11 @@ sha256sum -c browsercoin-miner-linux-x64.sha256
 chmod 755 browsercoin-miner-linux-x64
 ```
 
-Generate a fresh key once, then back up that file securely:
+Copy your public 64-character wallet address from the BrowserCoin wallet. Mining
+uses that address to receive block rewards and never needs your private key.
 
 ```bash
-./browsercoin-miner-linux-x64 --generate-key "$HOME/.browsercoin/miner.key"
+WALLET_ADDRESS=replace_with_your_64_character_wallet_address
 ```
 
 Start mining in the foreground. The miner prints live hashrate to the terminal;
@@ -94,26 +95,29 @@ a successfully found and submitted block is highlighted green:
 
 ```bash
 ./browsercoin-miner-linux-x64 \
-  --key-file "$HOME/.browsercoin/miner.key" \
+  --address "$WALLET_ADDRESS" \
   --workers 16
 ```
 
-Use the same key file on multiple machines only with non-overlapping nonce
+For the optional systemd deployment, set `BRC_ADDRESS` (not `BRC_KEY_FILE`) in
+`/etc/browsercoin/miner.env`.
+
+Use the same public address on multiple machines only with non-overlapping nonce
 lanes. For example, two 16-worker miners can use:
 
 ```bash
 # machine one
-./browsercoin-miner-linux-x64 --key-file "$HOME/.browsercoin/miner.key" \
+./browsercoin-miner-linux-x64 --address "$WALLET_ADDRESS" \
   --workers 16 --nonce-offset 0 --nonce-stride 32
 
 # machine two
-./browsercoin-miner-linux-x64 --key-file "$HOME/.browsercoin/miner.key" \
+./browsercoin-miner-linux-x64 --address "$WALLET_ADDRESS" \
   --workers 16 --nonce-offset 16 --nonce-stride 32
 ```
 
 Run `./browsercoin-miner-linux-x64 --help` for helpers, engine selection, and
-other options. Do not put the private-key hex directly on the command line:
-shell history and process listings can expose it.
+other options. The legacy `--key-file` option remains for existing installs,
+but it is not recommended: do not place a private key on a mining server.
 
 ## Scripts
 

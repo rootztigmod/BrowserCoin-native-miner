@@ -30,6 +30,7 @@ const DEFAULT_HELPERS = ['https://api1.browsercoin.org', 'https://api2.browserco
 const SYNC_INTERVAL_MS = 10_000;
 const REQUEST_TIMEOUT_MS = 12_000;
 const MAX_NATIVE_TEMPLATE_AGE_S = 60;
+const NONCE_SPACE = 0x1_0000_0000;
 export const MINER_VERSION = '0.2.0';
 
 export interface MinerRuntime {
@@ -384,7 +385,7 @@ async function request(url: string, init?: RequestInit): Promise<Response> {
 }
 
 function parseOptions(args: string[]): Options {
-  const workers = Math.max(1, Math.min(64, availableParallelism()));
+  const workers = Math.max(1, availableParallelism());
   let nonceStrideExplicit = false;
   const options: Options = {
     helpers: [...DEFAULT_HELPERS],
@@ -451,13 +452,15 @@ function parseAddress(value: string): Uint8Array {
 
 function positiveInt(value: string, name: string): number {
   const parsed = Number(value);
-  if (!Number.isSafeInteger(parsed) || parsed < 1 || parsed > 64) throw new Error(`${name} must be an integer between 1 and 64`);
+  if (!Number.isSafeInteger(parsed) || parsed < 1 || parsed > NONCE_SPACE) {
+    throw new Error(`${name} must be an integer between 1 and ${NONCE_SPACE}`);
+  }
   return parsed;
 }
 
 function nonceInteger(value: string, name: string, allowZero = false): number {
   const parsed = Number(value);
-  if (!Number.isSafeInteger(parsed) || parsed < (allowZero ? 0 : 1) || parsed > 0x1_0000_0000) {
+  if (!Number.isSafeInteger(parsed) || parsed < (allowZero ? 0 : 1) || parsed > NONCE_SPACE) {
     throw new Error(`${name} must be an integer between ${allowZero ? 0 : 1} and 4294967296`);
   }
   return parsed;

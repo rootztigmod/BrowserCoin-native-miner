@@ -19,6 +19,11 @@ uses the native engine by default:
 npm run mine:headless -- --key-file /etc/browsercoin/miner.key --workers 32
 ```
 
+`SANDGLASS_LANES` controls how many independent Sandglass hashes each worker
+interleaves (memory-level parallelism). Supported values: `1`, `2` (default),
+or `4`. On a Core Ultra 9 275HX, `2` was ~25% faster than `1`, while `4`
+regressed. Override only after benchmarking the target host.
+
 On Linux, set `SANDGLASS_HUGEPAGE=1` to allocate each worker's scratch mapping
 with transparent-huge-page advice. This is vector-equivalent and should be
 enabled only after benchmarking the target host. `SANDGLASS_PREFETCH=1` and

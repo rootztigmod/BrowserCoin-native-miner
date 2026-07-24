@@ -288,6 +288,130 @@ pub fn hash_meets_target(hash: &[u8; 32], target: &[u8; 32]) -> bool {
     hash < target
 }
 
+/// Independent Sandglass lanes interleaved for memory-level parallelism.
+/// Each lane owns its own 512 KiB scratch and computes an exact consensus digest.
+pub struct SandglassBatch<const LANES: usize> {
+    scratches: [Scratch; LANES],
+}
+
+impl<const LANES: usize> Default for SandglassBatch<LANES> {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl<const LANES: usize> SandglassBatch<LANES> {
+    pub fn new() -> Self {
+        assert!(LANES > 0, "SandglassBatch requires at least one lane");
+        Self {
+            scratches: std::array::from_fn(|_| Scratch::new()),
+        }
+    }
+
+    pub fn hash_batch(&mut self, headers: &[[u8; HEADER_LEN]; LANES]) -> [[u8; 32]; LANES] {
+        let mut seeds = [[0_u8; 32]; LANES];
+        for lane in 0..LANES {
+            seeds[lane] = Sha256::digest(headers[lane]).into();
+        }
+        let states = self.fill_and_walk_batch(&seeds);
+        let mut digests = [[0_u8; 32]; LANES];
+        for lane in 0..LANES {
+            let [h, a0, a1, a2, a3] = states[lane];
+            let mut final_input = [0_u8; 52];
+            final_input[..32].copy_from_slice(&seeds[lane]);
+            final_input[32..36].copy_from_slice(&h.to_be_bytes());
+            final_input[36..40].copy_from_slice(&a0.to_be_bytes());
+            final_input[40..44].copy_from_slice(&a1.to_be_bytes());
+            final_input[44..48].copy_from_slice(&a2.to_be_bytes());
+            final_input[48..52].copy_from_slice(&a3.to_be_bytes());
+            digests[lane] = Sha256::digest(final_input).into();
+        }
+        digests
+    }
+
+    fn fill_and_walk_batch(&mut self, seeds: &[[u8; 32]; LANES]) -> [[u32; 5]; LANES] {
+        let mut seed_words = [[0_u32; 8]; LANES];
+        let mut h = [0_u32; LANES];
+        let mut ptrs = [std::ptr::null_mut::<u32>(); LANES];
+        for lane in 0..LANES {
+            for (index, word) in seed_words[lane].iter_mut().enumerate() {
+                *word = u32::from_be_bytes(seeds[lane][index * 4..index * 4 + 4].try_into().unwrap());
+            }
+            h[lane] = mix(seed_words[lane][0] ^ GOLDEN);
+            ptrs[lane] = self.scratches[lane].as_mut_ptr();
+        }
+
+        // Interleave fill writes across lanes so multiple 512 KiB streams stay in flight.
+        for index in 0..WORDS {
+            for lane in 0..LANES {
+                h[lane] = mix(
+                    h[lane]
+                        .wrapping_add(GOLDEN)
+                        .wrapping_add(seed_words[lane][index & 7]),
+                );
+                // SAFETY: fill indexes are bounded by WORDS; each lane has its own scratch.
+                unsafe { *ptrs[lane].add(index) = h[lane] };
+            }
+        }
+
+        let mut a0 = [0_u32; LANES];
+        let mut a1 = [0_u32; LANES];
+        let mut a2 = [0_u32; LANES];
+        let mut a3 = [0_u32; LANES];
+        let mut i0 = [0_u32; LANES];
+        let mut i1 = [0_u32; LANES];
+        let mut i2 = [0_u32; LANES];
+        let mut i3 = [0_u32; LANES];
+        for lane in 0..LANES {
+            let mut x = h[lane];
+            x = mix(x ^ 1);
+            a0[lane] = mix(x ^ GOLDEN);
+            i0[lane] = x & MASK;
+            x = mix(x ^ 2);
+            a1[lane] = mix(x ^ GOLDEN);
+            i1[lane] = x & MASK;
+            x = mix(x ^ 3);
+            a2[lane] = mix(x ^ GOLDEN);
+            i2[lane] = x & MASK;
+            x = mix(x ^ 4);
+            a3[lane] = mix(x ^ GOLDEN);
+            i3[lane] = x & MASK;
+        }
+
+        // Interleave walk RMWs by chain across lanes. Within each lane the
+        // chain order remains 0→1→2→3 for every step, matching the scalar path.
+        for step in 0..PER_CHAIN {
+            for lane in 0..LANES {
+                // SAFETY: every index is masked with MASK after it is derived.
+                a0[lane] = mix(a0[lane] ^ unsafe { *ptrs[lane].add(i0[lane] as usize) });
+                unsafe { *ptrs[lane].add(i0[lane] as usize) = a0[lane].wrapping_add(step) };
+                i0[lane] = a0[lane] & MASK;
+            }
+            for lane in 0..LANES {
+                a1[lane] = mix(a1[lane] ^ unsafe { *ptrs[lane].add(i1[lane] as usize) });
+                unsafe { *ptrs[lane].add(i1[lane] as usize) = a1[lane].wrapping_add(step) };
+                i1[lane] = a1[lane] & MASK;
+            }
+            for lane in 0..LANES {
+                a2[lane] = mix(a2[lane] ^ unsafe { *ptrs[lane].add(i2[lane] as usize) });
+                unsafe { *ptrs[lane].add(i2[lane] as usize) = a2[lane].wrapping_add(step) };
+                i2[lane] = a2[lane] & MASK;
+            }
+            for lane in 0..LANES {
+                a3[lane] = mix(a3[lane] ^ unsafe { *ptrs[lane].add(i3[lane] as usize) });
+                unsafe { *ptrs[lane].add(i3[lane] as usize) = a3[lane].wrapping_add(step) };
+                i3[lane] = a3[lane] & MASK;
+            }
+        }
+
+        let mut states = [[0_u32; 5]; LANES];
+        for lane in 0..LANES {
+            states[lane] = [h[lane], a0[lane], a1[lane], a2[lane], a3[lane]];
+        }
+        states
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -309,6 +433,12 @@ mod tests {
         bytes
     }
 
+    fn header_with_nonce(base: &[u8; HEADER_LEN], nonce: u32) -> [u8; HEADER_LEN] {
+        let mut header = *base;
+        header[112..116].copy_from_slice(&nonce.to_be_bytes());
+        header
+    }
+
     #[test]
     fn matches_browsercoin_frozen_vectors() {
         let vectors: Vec<Vector> =
@@ -320,6 +450,50 @@ mod tests {
                 hasher.hash(&decode::<HEADER_LEN>(&vector.header_hex)),
                 decode::<32>(&vector.digest_hex)
             );
+        }
+    }
+
+    #[test]
+    fn batch_lanes_match_scalar() {
+        let vectors: Vec<Vector> =
+            serde_json::from_str(include_str!("../../../src/crypto/sandglass.vectors.json"))
+                .unwrap();
+        let base = decode::<HEADER_LEN>(&vectors[0].header_hex);
+        let mut scalar = Sandglass::new();
+        let mut batch2 = SandglassBatch::<2>::new();
+        let mut batch4 = SandglassBatch::<4>::new();
+
+        let headers2 = [
+            header_with_nonce(&base, 0),
+            header_with_nonce(&base, 1),
+        ];
+        let out2 = batch2.hash_batch(&headers2);
+        assert_eq!(out2[0], scalar.hash(&headers2[0]));
+        assert_eq!(out2[1], scalar.hash(&headers2[1]));
+
+        let headers4 = [
+            header_with_nonce(&base, 10),
+            header_with_nonce(&base, 11),
+            header_with_nonce(&base, 12),
+            header_with_nonce(&base, 13),
+        ];
+        let out4 = batch4.hash_batch(&headers4);
+        for lane in 0..4 {
+            assert_eq!(out4[lane], scalar.hash(&headers4[lane]));
+        }
+
+        // Exercise many nonces so walk index collisions are likely somewhere.
+        for nonce in (0_u32..256).step_by(4) {
+            let headers = [
+                header_with_nonce(&base, nonce),
+                header_with_nonce(&base, nonce.wrapping_add(1)),
+                header_with_nonce(&base, nonce.wrapping_add(2)),
+                header_with_nonce(&base, nonce.wrapping_add(3)),
+            ];
+            let batched = batch4.hash_batch(&headers);
+            for lane in 0..4 {
+                assert_eq!(batched[lane], scalar.hash(&headers[lane]));
+            }
         }
     }
 

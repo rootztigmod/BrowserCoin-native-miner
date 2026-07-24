@@ -1,4 +1,4 @@
-use browsercoin_sandglass::{HEADER_LEN, Sandglass, hash_meets_target};
+use browsercoin_sandglass::{HEADER_LEN, Sandglass, SandglassBatch, hash_meets_target};
 use serde::Deserialize;
 use serde_json::json;
 use std::io::{self, BufRead, Write};
@@ -68,8 +68,34 @@ enum Event {
     },
 }
 
+enum LaneHasher {
+    L1(Sandglass),
+    L2(SandglassBatch<2>),
+    L4(SandglassBatch<4>),
+}
+
+impl LaneHasher {
+    fn new(lanes: usize) -> Self {
+        match lanes {
+            1 => Self::L1(Sandglass::new()),
+            2 => Self::L2(SandglassBatch::<2>::new()),
+            4 => Self::L4(SandglassBatch::<4>::new()),
+            _ => unreachable!("parse_lanes only returns 1, 2, or 4"),
+        }
+    }
+
+    fn lanes(&self) -> usize {
+        match self {
+            Self::L1(_) => 1,
+            Self::L2(_) => 2,
+            Self::L4(_) => 4,
+        }
+    }
+}
+
 fn main() {
     let workers = parse_workers();
+    let lanes = parse_lanes();
     let output = Arc::new(Mutex::new(io::stdout()));
     let state = Arc::new((
         Mutex::new(JobState {
@@ -120,11 +146,14 @@ fn main() {
         .map(|worker| {
             let worker_state = Arc::clone(&state);
             let worker_events = events_tx.clone();
-            thread::spawn(move || worker_loop(worker, worker_state, worker_events))
+            thread::spawn(move || worker_loop(worker, lanes, worker_state, worker_events))
         })
         .collect();
     drop(events_tx);
-    write_json(&output, json!({ "type": "ready", "workers": workers }));
+    write_json(
+        &output,
+        json!({ "type": "ready", "workers": workers, "lanes": lanes }),
+    );
 
     for line in io::stdin().lock().lines() {
         let Ok(line) = line else { break };
@@ -165,8 +194,8 @@ fn main() {
     let _ = reporter.join();
 }
 
-fn worker_loop(worker: usize, state: SharedState, events: mpsc::Sender<Event>) {
-    let mut hasher = Sandglass::new();
+fn worker_loop(worker: usize, lanes: usize, state: SharedState, events: mpsc::Sender<Event>) {
+    let mut hasher = LaneHasher::new(lanes);
     let mut seen_generation = 0;
     loop {
         let job = {
@@ -191,35 +220,42 @@ fn grind(
     worker: usize,
     job: &Job,
     generation: u64,
-    hasher: &mut Sandglass,
+    hasher: &mut LaneHasher,
     state: &SharedState,
     events: &mpsc::Sender<Event>,
 ) {
     let start_nonce = job.nonce_offset.wrapping_add(worker as u32);
     let mut nonce = start_nonce;
-    let mut header = job.header;
     let mut hashes = 0_u64;
     let mut reported_at = Instant::now();
+    let lanes = hasher.lanes();
+    let batch_stride = job.nonce_stride.wrapping_mul(lanes as u32);
 
     loop {
         for _ in 0..CHECK_INTERVAL {
             if generation_changed(state, generation) {
                 return;
             }
-            header[NONCE_OFFSET..NONCE_OFFSET + 4].copy_from_slice(&nonce.to_be_bytes());
-            let hash = hasher.hash(&header);
-            hashes += 1;
-            if hash_meets_target(&hash, &job.target) {
+            if let Some((solved_nonce, hash)) =
+                grind_batch(hasher, job, nonce, start_nonce, &mut hashes)
+            {
                 clear_current_job(state, generation);
-                let _ = events.send(Event::Solved {
-                    worker,
-                    job_id: job.id,
-                    nonce,
-                    hash,
-                });
+                if let Some(hash) = hash {
+                    let _ = events.send(Event::Solved {
+                        worker,
+                        job_id: job.id,
+                        nonce: solved_nonce,
+                        hash,
+                    });
+                } else {
+                    let _ = events.send(Event::Exhausted {
+                        worker,
+                        job_id: job.id,
+                    });
+                }
                 return;
             }
-            nonce = nonce.wrapping_add(job.nonce_stride);
+            nonce = nonce.wrapping_add(batch_stride);
             if nonce == start_nonce {
                 clear_current_job(state, generation);
                 let _ = events.send(Event::Exhausted {
@@ -241,6 +277,94 @@ fn grind(
             reported_at = Instant::now();
         }
     }
+}
+
+/// Returns Some((nonce, Some(hash))) on solve, Some((nonce, None)) on exhaust mid-batch,
+/// or None to continue.
+fn grind_batch(
+    hasher: &mut LaneHasher,
+    job: &Job,
+    nonce: u32,
+    start_nonce: u32,
+    hashes: &mut u64,
+) -> Option<(u32, Option<[u8; 32]>)> {
+    match hasher {
+        LaneHasher::L1(hasher) => {
+            let mut header = job.header;
+            header[NONCE_OFFSET..NONCE_OFFSET + 4].copy_from_slice(&nonce.to_be_bytes());
+            let hash = hasher.hash(&header);
+            *hashes += 1;
+            if hash_meets_target(&hash, &job.target) {
+                return Some((nonce, Some(hash)));
+            }
+            None
+        }
+        LaneHasher::L2(hasher) => grind_lanes::<2, _>(
+            |headers| hasher.hash_batch(headers),
+            job,
+            nonce,
+            start_nonce,
+            hashes,
+        ),
+        LaneHasher::L4(hasher) => grind_lanes::<4, _>(
+            |headers| hasher.hash_batch(headers),
+            job,
+            nonce,
+            start_nonce,
+            hashes,
+        ),
+    }
+}
+
+fn grind_lanes<const LANES: usize, F>(
+    mut hash_batch: F,
+    job: &Job,
+    nonce: u32,
+    start_nonce: u32,
+    hashes: &mut u64,
+) -> Option<(u32, Option<[u8; 32]>)>
+where
+    F: FnMut(&[[u8; HEADER_LEN]; LANES]) -> [[u8; 32]; LANES],
+{
+    let mut headers = [[0_u8; HEADER_LEN]; LANES];
+    let mut lane_nonces = [0_u32; LANES];
+    let mut active = LANES;
+    for lane in 0..LANES {
+        let lane_nonce = nonce.wrapping_add(job.nonce_stride.wrapping_mul(lane as u32));
+        if lane > 0 && lane_nonce == start_nonce {
+            active = lane;
+            break;
+        }
+        lane_nonces[lane] = lane_nonce;
+        headers[lane] = job.header;
+        headers[lane][NONCE_OFFSET..NONCE_OFFSET + 4].copy_from_slice(&lane_nonce.to_be_bytes());
+    }
+    if active == 0 {
+        return Some((nonce, None));
+    }
+    if active == LANES {
+        let digests = hash_batch(&headers);
+        *hashes += LANES as u64;
+        for lane in 0..LANES {
+            if hash_meets_target(&digests[lane], &job.target) {
+                return Some((lane_nonces[lane], Some(digests[lane])));
+            }
+        }
+        return None;
+    }
+
+    // Partial final batch near nonce-space wrap: fall back to scalar-equivalent one-by-one
+    // through a temporary single-lane batch path by hashing only filled headers via full batch
+    // would mix unused lanes. Use single-hash Sandglass for the remainder instead.
+    let mut scalar = Sandglass::new();
+    for lane in 0..active {
+        let hash = scalar.hash(&headers[lane]);
+        *hashes += 1;
+        if hash_meets_target(&hash, &job.target) {
+            return Some((lane_nonces[lane], Some(hash)));
+        }
+    }
+    Some((nonce, None))
 }
 
 fn generation_changed(state: &SharedState, generation: u64) -> bool {
@@ -316,4 +440,18 @@ fn parse_workers() -> usize {
                 .map(usize::from)
                 .unwrap_or(1)
         })
+}
+
+fn parse_lanes() -> usize {
+    // Default to 2: local Core Ultra 9 measurements showed ~25% higher aggregate
+    // H/s than single-lane, while 4 lanes regressed from memory pressure.
+    match std::env::var("SANDGLASS_LANES").as_deref() {
+        Ok("1") => 1,
+        Ok("2") | Err(_) => 2,
+        Ok("4") => 4,
+        Ok(other) => {
+            eprintln!("sandglass-native-miner: invalid SANDGLASS_LANES={other}; using 2");
+            2
+        }
+    }
 }

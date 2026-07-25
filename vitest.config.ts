@@ -2,7 +2,7 @@ import { defineConfig } from 'vitest/config';
 
 export default defineConfig({
   test: {
-    include: ['src/**/*.test.ts'],
+    include: ['src/**/*.test.ts', 'tools/**/*.test.ts'],
     environment: 'node',
     // Argon2id at the v5 6-bit floor takes ~80–120ms per attempt × ~128
     // expected attempts ≈ 10–15 s per mined block in tests. The

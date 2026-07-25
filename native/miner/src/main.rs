@@ -21,6 +21,10 @@ struct Job {
     target: [u8; 32],
     nonce_offset: u32,
     nonce_stride: u32,
+    /// Exclusive upper bound for pool slots. `None` means full u32 wrap (solo).
+    nonce_end: Option<u32>,
+    /// When true, emit solves but keep grinding (pool share mode).
+    continuous: bool,
 }
 
 struct JobState {
@@ -44,6 +48,9 @@ enum Command {
         nonce_offset: u32,
         #[serde(rename = "nonceStride")]
         nonce_stride: u32,
+        #[serde(rename = "nonceEnd")]
+        nonce_end: Option<u32>,
+        continuous: Option<bool>,
     },
     Stop,
     Shutdown,
@@ -91,6 +98,12 @@ impl LaneHasher {
             Self::L4(_) => 4,
         }
     }
+}
+
+enum BatchOutcome {
+    Continue,
+    Exhausted,
+    Solved(Vec<(u32, [u8; 32])>),
 }
 
 fn main() {
@@ -164,9 +177,18 @@ fn main() {
                 target_hex,
                 nonce_offset,
                 nonce_stride,
+                nonce_end,
+                continuous,
             }) => {
-                let result =
-                    parse_job(job_id, &header_hex, &target_hex, nonce_offset, nonce_stride);
+                let result = parse_job(
+                    job_id,
+                    &header_hex,
+                    &target_hex,
+                    nonce_offset,
+                    nonce_stride,
+                    nonce_end,
+                    continuous.unwrap_or(false),
+                );
                 match result {
                     Ok(job) => replace_job(&state, Some(job)),
                     Err(error) => write_json(&output, json!({ "type": "error", "message": error })),
@@ -225,6 +247,15 @@ fn grind(
     events: &mpsc::Sender<Event>,
 ) {
     let start_nonce = job.nonce_offset.wrapping_add(worker as u32);
+    if let Some(end) = job.nonce_end {
+        if start_nonce >= end {
+            let _ = events.send(Event::Exhausted {
+                worker,
+                job_id: job.id,
+            });
+            return;
+        }
+    }
     let mut nonce = start_nonce;
     let mut hashes = 0_u64;
     let mut reported_at = Instant::now();
@@ -236,33 +267,56 @@ fn grind(
             if generation_changed(state, generation) {
                 return;
             }
-            if let Some((solved_nonce, hash)) =
-                grind_batch(hasher, job, nonce, start_nonce, &mut hashes)
-            {
-                clear_current_job(state, generation);
-                if let Some(hash) = hash {
-                    let _ = events.send(Event::Solved {
-                        worker,
-                        job_id: job.id,
-                        nonce: solved_nonce,
-                        hash,
-                    });
-                } else {
+            match grind_batch(hasher, job, nonce, start_nonce, &mut hashes) {
+                BatchOutcome::Continue => {}
+                BatchOutcome::Exhausted => {
+                    if !job.continuous {
+                        clear_current_job(state, generation);
+                    }
                     let _ = events.send(Event::Exhausted {
                         worker,
                         job_id: job.id,
                     });
+                    return;
                 }
-                return;
+                BatchOutcome::Solved(solves) => {
+                    for (solved_nonce, hash) in solves {
+                        let _ = events.send(Event::Solved {
+                            worker,
+                            job_id: job.id,
+                            nonce: solved_nonce,
+                            hash,
+                        });
+                    }
+                    if !job.continuous {
+                        clear_current_job(state, generation);
+                        return;
+                    }
+                }
             }
-            nonce = nonce.wrapping_add(batch_stride);
-            if nonce == start_nonce {
-                clear_current_job(state, generation);
-                let _ = events.send(Event::Exhausted {
-                    worker,
-                    job_id: job.id,
-                });
-                return;
+            let next = nonce.wrapping_add(batch_stride);
+            if let Some(end) = job.nonce_end {
+                if next >= end || next < nonce {
+                    if !job.continuous {
+                        clear_current_job(state, generation);
+                    }
+                    let _ = events.send(Event::Exhausted {
+                        worker,
+                        job_id: job.id,
+                    });
+                    return;
+                }
+                nonce = next;
+            } else {
+                nonce = next;
+                if nonce == start_nonce {
+                    clear_current_job(state, generation);
+                    let _ = events.send(Event::Exhausted {
+                        worker,
+                        job_id: job.id,
+                    });
+                    return;
+                }
             }
         }
         let elapsed = reported_at.elapsed();
@@ -279,25 +333,29 @@ fn grind(
     }
 }
 
-/// Returns Some((nonce, Some(hash))) on solve, Some((nonce, None)) on exhaust mid-batch,
-/// or None to continue.
 fn grind_batch(
     hasher: &mut LaneHasher,
     job: &Job,
     nonce: u32,
     start_nonce: u32,
     hashes: &mut u64,
-) -> Option<(u32, Option<[u8; 32]>)> {
+) -> BatchOutcome {
     match hasher {
         LaneHasher::L1(hasher) => {
+            if let Some(end) = job.nonce_end {
+                if nonce >= end {
+                    return BatchOutcome::Exhausted;
+                }
+            }
             let mut header = job.header;
             header[NONCE_OFFSET..NONCE_OFFSET + 4].copy_from_slice(&nonce.to_be_bytes());
             let hash = hasher.hash(&header);
             *hashes += 1;
             if hash_meets_target(&hash, &job.target) {
-                return Some((nonce, Some(hash)));
+                BatchOutcome::Solved(vec![(nonce, hash)])
+            } else {
+                BatchOutcome::Continue
             }
-            None
         }
         LaneHasher::L2(hasher) => grind_lanes::<2, _>(
             |headers| hasher.hash_batch(headers),
@@ -322,7 +380,7 @@ fn grind_lanes<const LANES: usize, F>(
     nonce: u32,
     start_nonce: u32,
     hashes: &mut u64,
-) -> Option<(u32, Option<[u8; 32]>)>
+) -> BatchOutcome
 where
     F: FnMut(&[[u8; HEADER_LEN]; LANES]) -> [[u8; 32]; LANES],
 {
@@ -331,40 +389,58 @@ where
     let mut active = LANES;
     for lane in 0..LANES {
         let lane_nonce = nonce.wrapping_add(job.nonce_stride.wrapping_mul(lane as u32));
-        if lane > 0 && lane_nonce == start_nonce {
+        if lane > 0 && job.nonce_end.is_none() && lane_nonce == start_nonce {
             active = lane;
             break;
+        }
+        if let Some(end) = job.nonce_end {
+            if lane_nonce >= end {
+                active = lane;
+                break;
+            }
         }
         lane_nonces[lane] = lane_nonce;
         headers[lane] = job.header;
         headers[lane][NONCE_OFFSET..NONCE_OFFSET + 4].copy_from_slice(&lane_nonce.to_be_bytes());
     }
     if active == 0 {
-        return Some((nonce, None));
+        return BatchOutcome::Exhausted;
     }
     if active == LANES {
         let digests = hash_batch(&headers);
         *hashes += LANES as u64;
+        let mut solves = Vec::new();
         for lane in 0..LANES {
             if hash_meets_target(&digests[lane], &job.target) {
-                return Some((lane_nonces[lane], Some(digests[lane])));
+                solves.push((lane_nonces[lane], digests[lane]));
+                if !job.continuous {
+                    break;
+                }
             }
         }
-        return None;
+        return if solves.is_empty() {
+            BatchOutcome::Continue
+        } else {
+            BatchOutcome::Solved(solves)
+        };
     }
 
-    // Partial final batch near nonce-space wrap: fall back to scalar-equivalent one-by-one
-    // through a temporary single-lane batch path by hashing only filled headers via full batch
-    // would mix unused lanes. Use single-hash Sandglass for the remainder instead.
     let mut scalar = Sandglass::new();
+    let mut solves = Vec::new();
     for lane in 0..active {
         let hash = scalar.hash(&headers[lane]);
         *hashes += 1;
         if hash_meets_target(&hash, &job.target) {
-            return Some((lane_nonces[lane], Some(hash)));
+            solves.push((lane_nonces[lane], hash));
+            if !job.continuous {
+                break;
+            }
         }
     }
-    Some((nonce, None))
+    if !solves.is_empty() {
+        return BatchOutcome::Solved(solves);
+    }
+    BatchOutcome::Exhausted
 }
 
 fn generation_changed(state: &SharedState, generation: u64) -> bool {
@@ -395,9 +471,16 @@ fn parse_job(
     target: &str,
     nonce_offset: u32,
     nonce_stride: u32,
+    nonce_end: Option<u32>,
+    continuous: bool,
 ) -> Result<Job, String> {
     if nonce_stride == 0 {
         return Err("nonceStride must be positive".into());
+    }
+    if let Some(end) = nonce_end {
+        if end <= nonce_offset {
+            return Err("nonceEnd must be greater than nonceOffset".into());
+        }
     }
     Ok(Job {
         id,
@@ -405,6 +488,8 @@ fn parse_job(
         target: decode_hex(target).ok_or("targetHex must contain exactly 32 bytes")?,
         nonce_offset,
         nonce_stride,
+        nonce_end,
+        continuous,
     })
 }
 

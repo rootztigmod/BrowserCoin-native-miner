@@ -9,10 +9,14 @@ export interface NativeMinerJob {
   targetHex: string;
   nonceOffset: number;
   nonceStride: number;
+  /** Exclusive upper bound for pool nonce slots. */
+  nonceEnd?: number;
+  /** Keep grinding after each solve (pool share mode). */
+  continuous?: boolean;
 }
 
 export type NativeMinerEvent =
-  | { type: 'ready'; workers: number }
+  | { type: 'ready'; workers: number; lanes?: number }
   | { type: 'hashrate'; worker: number; jobId: number; hashes: number; elapsedMs: number }
   | { type: 'solved'; worker: number; jobId: number; nonce: number; hash: string }
   | { type: 'exhausted'; worker: number; jobId: number }
@@ -47,7 +51,9 @@ export class NativeMiner {
       };
       child.once('error', (error) => fail(`native miner failed to start: ${error.message}`));
       child.once('exit', (code, signal) => {
-        if (code !== 0) fail(`native miner exited (${code ?? signal ?? 'unknown'})`);
+        // Ignore shutdown signals; surface only unexpected non-zero exits.
+        if (signal === 'SIGTERM' || signal === 'SIGINT') return;
+        if (code !== 0 && code !== null) fail(`native miner exited (${code ?? signal ?? 'unknown'})`);
       });
       createInterface({ input: child.stdout }).on('line', (line) => {
         try {
@@ -74,15 +80,29 @@ export class NativeMiner {
   }
 
   stop(): void {
-    this.send({ type: 'stop' });
+    try {
+      this.send({ type: 'stop' });
+    } catch {
+      // Process may already be shutting down.
+    }
   }
 
   async close(): Promise<void> {
     if (!this.child) return;
     const child = this.child;
     this.child = undefined;
-    this.sendTo(child, { type: 'shutdown' });
-    await new Promise<void>((resolve) => child.once('exit', () => resolve()));
+    try {
+      this.sendTo(child, { type: 'shutdown' });
+    } catch {
+      // Child stdin may already be closed.
+    }
+    await new Promise<void>((resolve) => {
+      if (child.exitCode !== null || child.signalCode !== null) {
+        resolve();
+        return;
+      }
+      child.once('exit', () => resolve());
+    });
   }
 
   private send(message: object): void {

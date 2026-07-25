@@ -115,6 +115,32 @@ lanes. For example, two 16-worker miners can use:
   --workers 16 --nonce-offset 16 --nonce-stride 32
 ```
 
+### Pool mining
+
+Classic BrowserCoin pools (for example FulgurPool) are supported with `--pool`.
+The miner registers a worker, long-polls jobs, grinds against the pool share
+target with the native Sandglass engine, and submits shares. Solo nonce-lane
+flags are not used in pool mode — the pool assigns each worker a nonce slot.
+
+```bash
+npm run build:native-miner
+npm run mine:headless -- \
+  --pool https://pool.fulgurpool.xyz \
+  --address "$WALLET_ADDRESS" \
+  --workers 24
+```
+
+Or with the standalone binary:
+
+```bash
+./browsercoin-miner-linux-x64 \
+  --pool https://pool.fulgurpool.xyz \
+  --address "$WALLET_ADDRESS" \
+  --workers 24
+```
+
+Negotiated WebSocket pools are not supported yet.
+
 Run `./browsercoin-miner-linux-x64 --help` for helpers, engine selection, and
 other options. The legacy `--key-file` option remains for existing installs,
 but it is not recommended: do not place a private key on a mining server.

@@ -25,13 +25,15 @@ import { addressFromHex, fromPrivateKey, generateKeyPair } from '../src/crypto/k
 import { attemptFastSync, fastSyncEligible } from '../src/net/fastSync.js';
 import { compactToTarget, bytesToHex, hexToBytes } from '../src/util/binary.js';
 import { NativeMiner, type NativeMinerEvent } from './native-miner.js';
+import { MINER_VERSION } from './miner-version.js';
+import { normalizePoolUrl, runPoolClient } from './pool-client.js';
 
 const DEFAULT_HELPERS = ['https://api1.browsercoin.org', 'https://api2.browsercoin.org'];
 const SYNC_INTERVAL_MS = 10_000;
 const REQUEST_TIMEOUT_MS = 12_000;
 const MAX_NATIVE_TEMPLATE_AGE_S = 60;
 const NONCE_SPACE = 0x1_0000_0000;
-export const MINER_VERSION = '0.2.0';
+export { MINER_VERSION };
 
 export interface MinerRuntime {
   nativeMinerPath?: string;
@@ -48,6 +50,8 @@ interface Options {
   nonceOffset: number;
   nonceStride: number;
   engine: 'native' | 'js';
+  pool?: string;
+  nonceLaneExplicit: boolean;
 }
 
 interface WorkerJob {
@@ -88,9 +92,41 @@ export async function runMiner(args = process.argv.slice(2), runtime: MinerRunti
   const miner = options.address
     ? parseAddress(options.address)
     : fromPrivateKey(await loadPrivateKey(options.keyFile!)).publicKey;
-  console.log(`[miner] address=${bytesToHex(miner)}`);
+  const addressHex = bytesToHex(miner);
+  console.log(`[miner] address=${addressHex}`);
+
+  if (options.pool) {
+    if (options.engine !== 'native') {
+      throw new Error('pool mode requires --engine native');
+    }
+    if (options.nonceLaneExplicit) {
+      throw new Error('pool mode ignores solo --nonce-offset/--nonce-stride; omit them (the pool assigns the nonce slot)');
+    }
+    const poolUrl = normalizePoolUrl(options.pool);
+    console.log(`[miner] mode=pool; engine=native; workers=${options.workers}; pool=${poolUrl}`);
+    const controller = new AbortController();
+    const onSignal = (): void => controller.abort();
+    process.once('SIGINT', onSignal);
+    process.once('SIGTERM', onSignal);
+    try {
+      await runPoolClient({
+        poolUrl,
+        payoutAddress: addressHex,
+        workers: options.workers,
+        nativeMinerPath: runtime.nativeMinerPath,
+        signal: controller.signal,
+      });
+    } catch (error) {
+      if ((error as Error)?.name !== 'AbortError') throw error;
+    } finally {
+      process.off('SIGINT', onSignal);
+      process.off('SIGTERM', onSignal);
+    }
+    return;
+  }
+
   console.log(
-    `[miner] engine=${options.engine}; workers=${options.workers}; nonce lanes=${options.nonceOffset}-${options.nonceOffset + options.workers - 1} ` +
+    `[miner] mode=solo; engine=${options.engine}; workers=${options.workers}; nonce lanes=${options.nonceOffset}-${options.nonceOffset + options.workers - 1} ` +
     `mod ${options.nonceStride}; helpers=${options.helpers.join(',')}`,
   );
 
@@ -387,12 +423,14 @@ async function request(url: string, init?: RequestInit): Promise<Response> {
 function parseOptions(args: string[]): Options {
   const workers = Math.max(1, availableParallelism());
   let nonceStrideExplicit = false;
+  let nonceOffsetExplicit = false;
   const options: Options = {
     helpers: [...DEFAULT_HELPERS],
     workers,
     nonceOffset: 0,
     nonceStride: workers,
     engine: 'native',
+    nonceLaneExplicit: false,
   };
   for (let index = 0; index < args.length; index++) {
     const value = args[index];
@@ -402,7 +440,12 @@ function parseOptions(args: string[]): Options {
     else if (value === '--generate-key' && next) { options.generateKey = next; index++; }
     else if (value === '--workers' && next) { options.workers = positiveInt(next, '--workers'); index++; }
     else if (value === '--engine' && next && (next === 'native' || next === 'js')) { options.engine = next; index++; }
-    else if (value === '--nonce-offset' && next) { options.nonceOffset = nonceInteger(next, '--nonce-offset', true); index++; }
+    else if (value === '--pool' && next) { options.pool = next; index++; }
+    else if (value === '--nonce-offset' && next) {
+      options.nonceOffset = nonceInteger(next, '--nonce-offset', true);
+      nonceOffsetExplicit = true;
+      index++;
+    }
     else if (value === '--nonce-stride' && next) {
       options.nonceStride = nonceInteger(next, '--nonce-stride');
       nonceStrideExplicit = true;
@@ -410,7 +453,8 @@ function parseOptions(args: string[]): Options {
     }
     else if (value === '--helper' && next) { options.helpers.push(next.replace(/\/$/, '')); index++; }
     else if (value === '--help') {
-      console.log('Usage: browsercoin-miner --address ADDRESS [--engine native|js] [--workers N] [--nonce-offset N] [--nonce-stride N] [--helper URL]');
+      console.log('Usage: browsercoin-miner --address ADDRESS [--pool URL] [--engine native|js] [--workers N] [--nonce-offset N] [--nonce-stride N] [--helper URL]');
+      console.log('       browsercoin-miner --pool https://pool.fulgurpool.xyz --address ADDRESS --workers 16');
       console.log('       browsercoin-miner --key-file PATH [options]  # legacy; exposes a private key to this host');
       console.log('       browsercoin-miner --generate-key PATH');
       process.exit(0);
@@ -418,11 +462,14 @@ function parseOptions(args: string[]): Options {
   }
   if (options.helpers.length > DEFAULT_HELPERS.length) options.helpers = options.helpers.slice(DEFAULT_HELPERS.length);
   if (!nonceStrideExplicit) options.nonceStride = options.workers;
-  if (options.nonceStride < options.workers) {
-    throw new Error('--nonce-stride must be at least --workers');
-  }
-  if (options.nonceOffset + options.workers > options.nonceStride) {
-    throw new Error('--nonce-offset plus --workers must not exceed --nonce-stride');
+  options.nonceLaneExplicit = nonceOffsetExplicit || nonceStrideExplicit;
+  if (!options.pool) {
+    if (options.nonceStride < options.workers) {
+      throw new Error('--nonce-stride must be at least --workers');
+    }
+    if (options.nonceOffset + options.workers > options.nonceStride) {
+      throw new Error('--nonce-offset plus --workers must not exceed --nonce-stride');
+    }
   }
   return options;
 }

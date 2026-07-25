@@ -132,8 +132,11 @@ export async function runPoolClient(options: PoolClientOptions): Promise<void> {
   let activePoolJobId: string | null = null;
   let activeNativeJobId = 0;
   let lastRestartKey: string | null = null;
+  let exhaustedKey: string | null = null;
   let nativeJobCounter = 0;
-  let slotExhaustedForNativeJob: number | null = null;
+  const exhaustedWorkers = new Set<number>();
+  let slotFullyExhausted = false;
+  let reregisterForFreshSlot = false;
   let forcePlainPoll = false;
   let cycleAbort: AbortController | null = null;
   let sleepWake: (() => void) | null = null;
@@ -158,10 +161,6 @@ export async function runPoolClient(options: PoolClientOptions): Promise<void> {
 
   function wakePoll(reason: 'exhaust' | 'stale' | 'stop'): void {
     forcePlainPoll = true;
-    if (reason === 'exhaust' || reason === 'stale') {
-      // Drop long-poll "have" semantics so the next request asks for work now.
-      // Keep activePoolJobId for share accounting until a new job arrives.
-    }
     const error = new Error(reason);
     error.name = 'WakeError';
     cycleAbort?.abort(error);
@@ -187,10 +186,18 @@ export async function runPoolClient(options: PoolClientOptions): Promise<void> {
       return;
     }
     if (event.type === 'exhausted') {
-      if (event.jobId !== activeNativeJobId) return;
-      if (slotExhaustedForNativeJob === event.jobId) return;
-      slotExhaustedForNativeJob = event.jobId;
-      console.log(`[pool-miner] nonce slot exhausted for job=${activePoolJobId ?? event.jobId}; requesting new work`);
+      if (event.jobId !== activeNativeJobId || slotFullyExhausted) return;
+      exhaustedWorkers.add(event.worker);
+      if (exhaustedWorkers.size < options.workers) return;
+      // Pool keeps the same slot on /job for this workerId. A fresh /register is
+      // what yields the next nonce window (same as restarting the binary).
+      slotFullyExhausted = true;
+      exhaustedKey = lastRestartKey;
+      lastRestartKey = null;
+      reregisterForFreshSlot = true;
+      console.log(
+        `[pool-miner] nonce slot exhausted for job=${activePoolJobId ?? event.jobId}; re-registering for fresh slot`,
+      );
       wakePoll('exhaust');
       return;
     }
@@ -237,7 +244,7 @@ export async function runPoolClient(options: PoolClientOptions): Promise<void> {
         } else if (body.result === 'stale') {
           console.log(`[pool-miner] share stale: job=${jobId}`);
           lastRestartKey = null;
-          slotExhaustedForNativeJob = activeNativeJobId;
+          exhaustedKey = null;
           nativeMiner.stop();
           wakePoll('stale');
         } else {
@@ -265,7 +272,10 @@ export async function runPoolClient(options: PoolClientOptions): Promise<void> {
     epoch += 1;
     activePoolJobId = null;
     lastRestartKey = null;
-    slotExhaustedForNativeJob = null;
+    exhaustedKey = null;
+    exhaustedWorkers.clear();
+    slotFullyExhausted = false;
+    reregisterForFreshSlot = false;
     submitted.clear();
     nativeMiner.stop();
     console.log(`[pool-miner] re-registered worker ${workerId}`);
@@ -293,13 +303,17 @@ export async function runPoolClient(options: PoolClientOptions): Promise<void> {
 
     const job = response.body;
     const key = jobRestartKey(job);
+    // Same finished slot under the old workerId — do not re-grind it.
+    if (exhaustedKey && key === exhaustedKey) return 'same';
     if (key === lastRestartKey) return 'same';
 
     nativeJobCounter += 1;
     activeNativeJobId = nativeJobCounter;
     activePoolJobId = job.jobId;
     lastRestartKey = key;
-    slotExhaustedForNativeJob = null;
+    exhaustedKey = null;
+    exhaustedWorkers.clear();
+    slotFullyExhausted = false;
     nativeToPoolJob.set(activeNativeJobId, { poolJobId: job.jobId, workerId, epoch });
     submitted.clear();
 
@@ -321,10 +335,23 @@ export async function runPoolClient(options: PoolClientOptions): Promise<void> {
 
   try {
     while (!stopping && !options.signal?.aborted) {
-      const exhausted = slotExhaustedForNativeJob !== null
-        && slotExhaustedForNativeJob === activeNativeJobId;
-      // After a slot is finished, do not long-poll with have= — ask for work immediately.
-      const have: string | null = (!forcePlainPoll && !exhausted) ? activePoolJobId : null;
+      if (reregisterForFreshSlot) {
+        reregisterForFreshSlot = false;
+        try {
+          await reregister();
+        } catch (error) {
+          if ((error as Error)?.name === 'AbortError' || stopping) break;
+          console.warn(`[pool-miner] re-register after slot exhaust failed: ${(error as Error).message}`);
+          await interruptibleSleep(jobPollMs);
+          reregisterForFreshSlot = true;
+          continue;
+        }
+        forcePlainPoll = true;
+        continue;
+      }
+
+      // After a finished slot / stale wake, plain-poll immediately for the next assignment.
+      const have: string | null = forcePlainPoll ? null : activePoolJobId;
       const usedWait = have ? waitS : 0;
       forcePlainPoll = false;
 
@@ -350,9 +377,12 @@ export async function runPoolClient(options: PoolClientOptions): Promise<void> {
 
       if (stopping || options.signal?.aborted) break;
       if (result === 'reregister' || result === 'ok') continue;
-      // Exhaust wake / same finished job: poll again immediately (or after a short delay).
-      if (result === 'retry' && exhausted) continue;
-      await interruptibleSleep(exhausted || result === 'same' ? Math.min(250, jobPollMs) : jobPollMs);
+      // Still seeing the exhausted slot: re-register again for a new window.
+      if (result === 'same' && exhaustedKey) {
+        reregisterForFreshSlot = true;
+        continue;
+      }
+      await interruptibleSleep(result === 'same' ? Math.min(250, jobPollMs) : jobPollMs);
     }
   } finally {
     await stop();

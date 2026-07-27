@@ -1,11 +1,12 @@
 # BrowserCoin
 
-**A real cryptocurrency that lives entirely in your browser.** Open the page, get a wallet automatically, mine on your CPU, send coins to other browsers — all in one tab. No installs, no extensions, no native binary.
+**A real cryptocurrency with a browser client and a native Linux miner.** Open the page, get a wallet automatically, mine in a tab, and send coins to other browsers — or download the standalone Sandglass miner for higher CPU hashrate (solo or pool). No browser extensions required.
 
-- 🌐 **Live demo:** [browsercoin.org](https://browsercoin.org)
-- 💻 **Source:** [github.com/swompythesecond/BrowserCoin](https://github.com/swompythesecond/BrowserCoin)
+- 🌐 **Live network:** [browsercoin.org](https://browsercoin.org)
+- ⛏ **Native miner (this repo):** [github.com/rootztigmod/BrowserCoin-native-miner](https://github.com/rootztigmod/BrowserCoin-native-miner)
+- 💻 **Browser app upstream:** [github.com/swompythesecond/BrowserCoin](https://github.com/swompythesecond/BrowserCoin)
 
-> **Status:** v0.2 — full end-to-end implementation with a fresh UI. Memory-hard Argon2id PoW, ASERT difficulty retargeting, no centralized checkpoints.
+> **Status:** miner-v0.2.7 — standalone Linux Sandglass miner with `--address` payout mining, `--pool` support (e.g. FulgurPool), and multi-lane CPU grinding. Same BrowserCoin network as the browser client.
 
 ---
 
@@ -75,7 +76,7 @@ Download a published `miner-v*` release and verify its checksum before running
 it:
 
 ```bash
-VERSION=miner-v0.2.0 # replace with the release tag
+VERSION=miner-v0.2.7 # replace with the latest miner-v* release tag
 BASE="https://github.com/rootztigmod/BrowserCoin-native-miner/releases/download/$VERSION"
 curl -fLO "$BASE/browsercoin-miner-linux-x64"
 curl -fLO "$BASE/browsercoin-miner-linux-x64.sha256"
@@ -229,4 +230,4 @@ MIT — see `LICENSE`.
 
 ---
 
-Built by [@swompythesecond](https://github.com/swompythesecond) · [browsercoin.org](https://browsercoin.org) · [Source on GitHub](https://github.com/swompythesecond/BrowserCoin)
+Browser app by [@swompythesecond](https://github.com/swompythesecond) · Native miner: [rootztigmod/BrowserCoin-native-miner](https://github.com/rootztigmod/BrowserCoin-native-miner) · [browsercoin.org](https://browsercoin.org)

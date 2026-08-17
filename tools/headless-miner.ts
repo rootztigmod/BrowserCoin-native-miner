@@ -69,6 +69,7 @@ interface Candidate {
 interface Tip {
   height: number;
   tipHash: string;
+  helper: string;
 }
 
 export async function runMiner(args = process.argv.slice(2), runtime: MinerRuntime = {}): Promise<void> {
@@ -341,19 +342,60 @@ async function initialSync(chain: Blockchain, mempool: Mempool, helpers: string[
 async function sync(chain: Blockchain, mempool: Mempool, helpers: string[]): Promise<void> {
   const tip = await getBestTip(helpers);
 
+  // Contiguous pull only. Never treat lookback duplicates as "progress" that
+  // lets us jump past a rejected height — that permanently stalls tip advance
+  // while the miner keeps grinding the same stale template.
   let cursor = Math.max(0, chain.height + 1 - 5);
   while (cursor <= tip.height) {
-    const batch = await firstJson<{ blocks: string[] }>(helpers, `/blocks?fromHeight=${cursor}&max=200`);
+    const batch = await blocksFromTipHelper(tip, helpers, cursor);
     if (batch.blocks.length === 0) break;
-    let accepted = 0;
+
+    const cursorBefore = cursor;
+    let nextExpected = cursor;
+    let backoff = false;
+    let hardReject = false;
+
     for (const encoded of batch.blocks) {
-      const block = decodeBlockHex(encoded);
+      let block: Block;
+      try {
+        block = decodeBlockHex(encoded);
+      } catch (error) {
+        console.warn(`[miner] ignored malformed block near height ${nextExpected}: ${String(error)}`);
+        hardReject = true;
+        break;
+      }
+
+      if (block.header.height < nextExpected) continue;
+      if (block.header.height > nextExpected) {
+        console.warn(
+          `[miner] helper block gap at height ${nextExpected} (got ${block.header.height}); stopping sync round`,
+        );
+        hardReject = true;
+        break;
+      }
+
       const error = await chain.addBlock(block);
-      if (error === null) accepted++;
-      else if (error !== 'parent block unknown') console.warn(`[miner] ignored block ${block.header.height}: ${error}`);
+      if (error === null) {
+        nextExpected = block.header.height + 1;
+        continue;
+      }
+      if (error === 'parent block unknown') {
+        backoff = true;
+        break;
+      }
+      console.warn(`[miner] ignored block ${block.header.height}: ${error}`);
+      // Consensus reject of the next needed block: retry next tick, do not skip.
+      hardReject = true;
+      break;
     }
-    if (accepted === 0) break;
-    cursor += batch.blocks.length;
+
+    if (backoff) {
+      cursor = Math.max(0, cursorBefore - 200);
+      continue;
+    }
+    if (hardReject) break;
+    if (nextExpected <= cursorBefore) break;
+    cursor = nextExpected;
   }
 
   mempool.clear();
@@ -369,8 +411,24 @@ async function sync(chain: Blockchain, mempool: Mempool, helpers: string[]): Pro
   }
 }
 
+async function blocksFromTipHelper(
+  tip: Tip,
+  helpers: string[],
+  cursor: number,
+): Promise<{ blocks: string[] }> {
+  const path = `/blocks?fromHeight=${cursor}&max=200`;
+  try {
+    return await getJson<{ blocks: string[] }>(`${tip.helper}${path}`);
+  } catch {
+    return firstJson<{ blocks: string[] }>(helpers, path);
+  }
+}
+
 async function getBestTip(helpers: string[]): Promise<Tip> {
-  const tips = await Promise.allSettled(helpers.map((helper) => getJson<Tip>(`${helper}/tip`)));
+  const tips = await Promise.allSettled(helpers.map(async (helper) => {
+    const tip = await getJson<{ height: number; tipHash: string }>(`${helper}/tip`);
+    return { height: tip.height, tipHash: tip.tipHash, helper };
+  }));
   const tip = tips
     .filter((result): result is PromiseFulfilledResult<Tip> => result.status === 'fulfilled')
     .map((result) => result.value)

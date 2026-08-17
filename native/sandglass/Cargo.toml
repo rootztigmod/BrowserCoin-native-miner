@@ -6,7 +6,12 @@ edition = "2024"
 [dependencies]
 libc = "0.2"
 sha2 = "0.10"
+serde_json = "1"
 
 [dev-dependencies]
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+
+[[bin]]
+name = "sandglass-phase-bench"
+path = "src/bin/phase_bench.rs"

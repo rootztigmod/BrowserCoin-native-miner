@@ -24,6 +24,20 @@ interleaves (memory-level parallelism). Supported values: `1`, `2` (default),
 or `4`. On a Core Ultra 9 275HX, `2` was ~25% faster than `1`, while `4`
 regressed. Override only after benchmarking the target host.
 
+Phase split timing (fill vs walk vs full) for LANES=2:
+
+```bash
+cd native && SANDGLASS_HUGEPAGE=1 cargo run -p browsercoin-sandglass --release --bin sandglass-phase-bench -- 40
+```
+
+Walk dominates (~90%+). An experimental hand-unrolled LANES=2 kernel exists
+behind `SANDGLASS_L2_KERNEL=1`; default stays on the generic interleaved batch
+because the unrolled path regressed aggregate H/s in A/B tests.
+
+`SANDGLASS_PREFETCH=1` also turns on light software prefetch inside the
+generic interleaved walk (next-chain indices). Locally this was ~flat vs
+baseline; re-check on the target host.
+
 On Linux, set `SANDGLASS_HUGEPAGE=1` to allocate each worker's scratch mapping
 with transparent-huge-page advice. This is vector-equivalent and should be
 enabled only after benchmarking the target host. `SANDGLASS_PREFETCH=1` and

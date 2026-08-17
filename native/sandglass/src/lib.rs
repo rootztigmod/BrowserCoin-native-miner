@@ -330,6 +330,27 @@ impl<const LANES: usize> SandglassBatch<LANES> {
     }
 
     fn fill_and_walk_batch(&mut self, seeds: &[[u8; 32]; LANES]) -> [[u32; 5]; LANES] {
+        // Specialized LANES=2 kernel (unrolled). Opt-in via SANDGLASS_L2_KERNEL=1;
+        // default remains the generic interleaved batch (faster in aggregate benches).
+        if LANES == 2 && l2_kernel_enabled() {
+            let seeds2 = [
+                seeds[0],
+                seeds.get(1).copied().unwrap_or([0_u8; 32]),
+            ];
+            // SAFETY: LANES == 2, so scratches has exactly two elements.
+            let scratches: &mut [Scratch; 2] =
+                unsafe { &mut *(self.scratches.as_mut_ptr() as *mut [Scratch; 2]) };
+            let states2 = fill_and_walk_batch_l2(scratches, &seeds2);
+            let mut states = [[0_u32; 5]; LANES];
+            for i in 0..LANES.min(2) {
+                states[i] = states2[i];
+            }
+            return states;
+        }
+        self.fill_and_walk_batch_generic(seeds)
+    }
+
+    fn fill_and_walk_batch_generic(&mut self, seeds: &[[u8; 32]; LANES]) -> [[u32; 5]; LANES] {
         let mut seed_words = [[0_u32; 8]; LANES];
         let mut h = [0_u32; LANES];
         let mut ptrs = [std::ptr::null_mut::<u32>(); LANES];
@@ -380,22 +401,50 @@ impl<const LANES: usize> SandglassBatch<LANES> {
 
         // Interleave walk RMWs by chain across lanes. Within each lane the
         // chain order remains 0→1→2→3 for every step, matching the scalar path.
+        // With SANDGLASS_PREFETCH=1, prefetch the next chain's current indices
+        // (and the just-updated index) so the RMW stream stays in flight without
+        // changing the access order.
+        let do_prefetch = prefetch_enabled();
         for step in 0..PER_CHAIN {
+            if do_prefetch {
+                #[cfg(target_arch = "x86_64")]
+                for lane in 0..LANES {
+                    prefetch(unsafe { ptrs[lane].add(i0[lane] as usize) });
+                }
+            }
             for lane in 0..LANES {
                 // SAFETY: every index is masked with MASK after it is derived.
                 a0[lane] = mix(a0[lane] ^ unsafe { *ptrs[lane].add(i0[lane] as usize) });
                 unsafe { *ptrs[lane].add(i0[lane] as usize) = a0[lane].wrapping_add(step) };
                 i0[lane] = a0[lane] & MASK;
             }
+            if do_prefetch {
+                #[cfg(target_arch = "x86_64")]
+                for lane in 0..LANES {
+                    prefetch(unsafe { ptrs[lane].add(i1[lane] as usize) });
+                }
+            }
             for lane in 0..LANES {
                 a1[lane] = mix(a1[lane] ^ unsafe { *ptrs[lane].add(i1[lane] as usize) });
                 unsafe { *ptrs[lane].add(i1[lane] as usize) = a1[lane].wrapping_add(step) };
                 i1[lane] = a1[lane] & MASK;
             }
+            if do_prefetch {
+                #[cfg(target_arch = "x86_64")]
+                for lane in 0..LANES {
+                    prefetch(unsafe { ptrs[lane].add(i2[lane] as usize) });
+                }
+            }
             for lane in 0..LANES {
                 a2[lane] = mix(a2[lane] ^ unsafe { *ptrs[lane].add(i2[lane] as usize) });
                 unsafe { *ptrs[lane].add(i2[lane] as usize) = a2[lane].wrapping_add(step) };
                 i2[lane] = a2[lane] & MASK;
+            }
+            if do_prefetch {
+                #[cfg(target_arch = "x86_64")]
+                for lane in 0..LANES {
+                    prefetch(unsafe { ptrs[lane].add(i3[lane] as usize) });
+                }
             }
             for lane in 0..LANES {
                 a3[lane] = mix(a3[lane] ^ unsafe { *ptrs[lane].add(i3[lane] as usize) });
@@ -412,10 +461,168 @@ impl<const LANES: usize> SandglassBatch<LANES> {
     }
 }
 
+impl SandglassBatch<2> {
+    /// Fill both 512 KiB scratches only (for phase micro-benchmarks).
+    pub fn fill_only(&mut self, seeds: &[[u8; 32]; 2]) -> [u32; 2] {
+        fill_batch_l2(&mut self.scratches, seeds)
+    }
+
+    /// Walk both scratches only; buffers must already be filled for `h`.
+    pub fn walk_only(&mut self, h: [u32; 2]) -> [[u32; 5]; 2] {
+        walk_batch_l2(&mut self.scratches, h)
+    }
+}
+
+/// Specialized LANES=2 fill+walk: fully unrolled lanes + software prefetch on
+/// the next RMW index. Digests match the generic/scalar path.
+fn fill_and_walk_batch_l2(scratches: &mut [Scratch; 2], seeds: &[[u8; 32]; 2]) -> [[u32; 5]; 2] {
+    let h = fill_batch_l2(scratches, seeds);
+    walk_batch_l2(scratches, h)
+}
+
+fn fill_batch_l2(scratches: &mut [Scratch; 2], seeds: &[[u8; 32]; 2]) -> [u32; 2] {
+    let mut seed_words0 = [0_u32; 8];
+    let mut seed_words1 = [0_u32; 8];
+    for index in 0..8 {
+        seed_words0[index] =
+            u32::from_be_bytes(seeds[0][index * 4..index * 4 + 4].try_into().unwrap());
+        seed_words1[index] =
+            u32::from_be_bytes(seeds[1][index * 4..index * 4 + 4].try_into().unwrap());
+    }
+
+    let mut h0 = mix(seed_words0[0] ^ GOLDEN);
+    let mut h1 = mix(seed_words1[0] ^ GOLDEN);
+    let ptr0 = scratches[0].as_mut_ptr();
+    let ptr1 = scratches[1].as_mut_ptr();
+
+    // Unrolled 2-lane fill: keep both write streams in flight.
+    for index in 0..WORDS {
+        h0 = mix(h0.wrapping_add(GOLDEN).wrapping_add(seed_words0[index & 7]));
+        h1 = mix(h1.wrapping_add(GOLDEN).wrapping_add(seed_words1[index & 7]));
+        // SAFETY: fill indexes are bounded by WORDS.
+        unsafe {
+            *ptr0.add(index) = h0;
+            *ptr1.add(index) = h1;
+        }
+    }
+    [h0, h1]
+}
+
+fn walk_batch_l2(scratches: &mut [Scratch; 2], h: [u32; 2]) -> [[u32; 5]; 2] {
+    let ptr0 = scratches[0].as_mut_ptr();
+    let ptr1 = scratches[1].as_mut_ptr();
+
+    let (mut a0_0, mut i0_0, mut a1_0, mut i1_0, mut a2_0, mut i2_0, mut a3_0, mut i3_0) =
+        init_walk_chains(h[0]);
+    let (mut a0_1, mut i0_1, mut a1_1, mut i1_1, mut a2_1, mut i2_1, mut a3_1, mut i3_1) =
+        init_walk_chains(h[1]);
+
+    // Prefetch next RMW targets when SANDGLASS_PREFETCH=1 (same opt-in as scalar).
+    // Aggressive always-on prefetch regressed aggregate H/s on L2-fit LANES=2 hosts.
+    let do_prefetch = prefetch_enabled();
+
+    for step in 0..PER_CHAIN {
+        // SAFETY: every index is masked with MASK after it is derived.
+        unsafe {
+            a0_0 = mix(a0_0 ^ *ptr0.add(i0_0 as usize));
+            *ptr0.add(i0_0 as usize) = a0_0.wrapping_add(step);
+            i0_0 = a0_0 & MASK;
+            a0_1 = mix(a0_1 ^ *ptr1.add(i0_1 as usize));
+            *ptr1.add(i0_1 as usize) = a0_1.wrapping_add(step);
+            i0_1 = a0_1 & MASK;
+            if do_prefetch {
+                #[cfg(target_arch = "x86_64")]
+                {
+                    prefetch(ptr0.add(i0_0 as usize));
+                    prefetch(ptr1.add(i0_1 as usize));
+                }
+            }
+
+            a1_0 = mix(a1_0 ^ *ptr0.add(i1_0 as usize));
+            *ptr0.add(i1_0 as usize) = a1_0.wrapping_add(step);
+            i1_0 = a1_0 & MASK;
+            a1_1 = mix(a1_1 ^ *ptr1.add(i1_1 as usize));
+            *ptr1.add(i1_1 as usize) = a1_1.wrapping_add(step);
+            i1_1 = a1_1 & MASK;
+            if do_prefetch {
+                #[cfg(target_arch = "x86_64")]
+                {
+                    prefetch(ptr0.add(i1_0 as usize));
+                    prefetch(ptr1.add(i1_1 as usize));
+                }
+            }
+
+            a2_0 = mix(a2_0 ^ *ptr0.add(i2_0 as usize));
+            *ptr0.add(i2_0 as usize) = a2_0.wrapping_add(step);
+            i2_0 = a2_0 & MASK;
+            a2_1 = mix(a2_1 ^ *ptr1.add(i2_1 as usize));
+            *ptr1.add(i2_1 as usize) = a2_1.wrapping_add(step);
+            i2_1 = a2_1 & MASK;
+            if do_prefetch {
+                #[cfg(target_arch = "x86_64")]
+                {
+                    prefetch(ptr0.add(i2_0 as usize));
+                    prefetch(ptr1.add(i2_1 as usize));
+                }
+            }
+
+            a3_0 = mix(a3_0 ^ *ptr0.add(i3_0 as usize));
+            *ptr0.add(i3_0 as usize) = a3_0.wrapping_add(step);
+            i3_0 = a3_0 & MASK;
+            a3_1 = mix(a3_1 ^ *ptr1.add(i3_1 as usize));
+            *ptr1.add(i3_1 as usize) = a3_1.wrapping_add(step);
+            i3_1 = a3_1 & MASK;
+            if do_prefetch {
+                #[cfg(target_arch = "x86_64")]
+                {
+                    prefetch(ptr0.add(i3_0 as usize));
+                    prefetch(ptr1.add(i3_1 as usize));
+                }
+            }
+        }
+    }
+
+    [
+        [h[0], a0_0, a1_0, a2_0, a3_0],
+        [h[1], a0_1, a1_1, a2_1, a3_1],
+    ]
+}
+
+#[inline(always)]
+fn init_walk_chains(h: u32) -> (u32, u32, u32, u32, u32, u32, u32, u32) {
+    let mut x = h;
+    x = mix(x ^ 1);
+    let a0 = mix(x ^ GOLDEN);
+    let i0 = x & MASK;
+    x = mix(x ^ 2);
+    let a1 = mix(x ^ GOLDEN);
+    let i1 = x & MASK;
+    x = mix(x ^ 3);
+    let a2 = mix(x ^ GOLDEN);
+    let i2 = x & MASK;
+    x = mix(x ^ 4);
+    let a3 = mix(x ^ GOLDEN);
+    let i3 = x & MASK;
+    (a0, i0, a1, i1, a2, i2, a3, i3)
+}
+
+fn l2_kernel_enabled() -> bool {
+    // Default OFF: on L2-fit hosts the generic interleaved batch path beat the
+    // hand-unrolled LANES=2 kernel in aggregate H/s. Opt in with SANDGLASS_L2_KERNEL=1.
+    static FLAG: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *FLAG.get_or_init(|| std::env::var("SANDGLASS_L2_KERNEL").as_deref() == Ok("1"))
+}
+
+fn prefetch_enabled() -> bool {
+    static FLAG: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *FLAG.get_or_init(|| std::env::var("SANDGLASS_PREFETCH").is_ok_and(|value| value == "1"))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use serde::Deserialize;
+    use sha2::{Digest, Sha256};
 
     #[derive(Deserialize)]
     struct Vector {
@@ -493,6 +700,43 @@ mod tests {
             let batched = batch4.hash_batch(&headers);
             for lane in 0..4 {
                 assert_eq!(batched[lane], scalar.hash(&headers[lane]));
+            }
+        }
+    }
+
+    #[test]
+    fn lanes2_fill_walk_split_matches_hash_batch() {
+        let vectors: Vec<Vector> =
+            serde_json::from_str(include_str!("../../../src/crypto/sandglass.vectors.json"))
+                .unwrap();
+        let base = decode::<HEADER_LEN>(&vectors[0].header_hex);
+        let mut batch = SandglassBatch::<2>::new();
+        let mut scalar = Sandglass::new();
+
+        for nonce in 0_u32..64 {
+            let headers = [
+                header_with_nonce(&base, nonce),
+                header_with_nonce(&base, nonce.wrapping_add(1)),
+            ];
+            let seeds = [
+                Sha256::digest(headers[0]).into(),
+                Sha256::digest(headers[1]).into(),
+            ];
+            let h = batch.fill_only(&seeds);
+            let states = batch.walk_only(h);
+            let digests = batch.hash_batch(&headers);
+            for lane in 0..2 {
+                let [hh, a0, a1, a2, a3] = states[lane];
+                let mut final_input = [0_u8; 52];
+                final_input[..32].copy_from_slice(&seeds[lane]);
+                final_input[32..36].copy_from_slice(&hh.to_be_bytes());
+                final_input[36..40].copy_from_slice(&a0.to_be_bytes());
+                final_input[40..44].copy_from_slice(&a1.to_be_bytes());
+                final_input[44..48].copy_from_slice(&a2.to_be_bytes());
+                final_input[48..52].copy_from_slice(&a3.to_be_bytes());
+                let from_split: [u8; 32] = Sha256::digest(final_input).into();
+                assert_eq!(from_split, digests[lane]);
+                assert_eq!(digests[lane], scalar.hash(&headers[lane]));
             }
         }
     }

@@ -179,8 +179,7 @@ export async function runMiner(args = process.argv.slice(2), runtime: MinerRunti
       if (age < MAX_NATIVE_TEMPLATE_AGE_S) {
         console.log(`[miner] retained template height=${activeNativeCandidate.block.header.height}; age=${age}s`);
         await sleep(SYNC_INTERVAL_MS);
-        await sync(chain, mempool, options.helpers);
-        console.log(`[miner] refreshed height=${chain.height} tip=${bytesToHex(chain.tip.hash)}`);
+        await syncSoft(chain, mempool, options.helpers);
         continue;
       }
       console.log(`[miner] rebuilding template: timestamp age=${age}s`);
@@ -268,11 +267,10 @@ export async function runMiner(args = process.argv.slice(2), runtime: MinerRunti
     }, 1_000);
 
     await sleep(SYNC_INTERVAL_MS);
-    if (!solved) {
-      await sync(chain, mempool, options.helpers);
-      console.log(`[miner] refreshed height=${chain.height} tip=${bytesToHex(chain.tip.hash)}`);
-    }
+    if (!solved) await syncSoft(chain, mempool, options.helpers);
   }
+  await stopWorkers();
+  await nativeMiner?.close();
 }
 
 function buildCandidate(chain: Blockchain, mempool: Mempool, miner: Uint8Array): Candidate {
@@ -339,6 +337,19 @@ async function initialSync(chain: Blockchain, mempool: Mempool, helpers: string[
   await sync(chain, mempool, helpers);
 }
 
+async function syncSoft(chain: Blockchain, mempool: Mempool, helpers: string[]): Promise<void> {
+  try {
+    await sync(chain, mempool, helpers);
+    console.log(`[miner] refreshed height=${chain.height} tip=${bytesToHex(chain.tip.hash)}`);
+  } catch (error) {
+    // Helper blips must not kill the mining loop: an uncaught throw used to print
+    // "fatal" while leaving native workers + the status timer alive at a stale height.
+    console.warn(
+      `[miner] sync deferred (helpers unreachable): ${error instanceof Error ? error.message : String(error)}`,
+    );
+  }
+}
+
 async function sync(chain: Blockchain, mempool: Mempool, helpers: string[]): Promise<void> {
   const tip = await getBestTip(helpers);
 
@@ -398,16 +409,22 @@ async function sync(chain: Blockchain, mempool: Mempool, helpers: string[]): Pro
     cursor = nextExpected;
   }
 
-  mempool.clear();
-  const pending = await firstJson<{ txs: string[] }>(helpers, '/mempool');
-  for (const encoded of pending.txs) {
-    try {
-      const { tx, next } = decodeTx(hexToBytes(encoded));
-      if (next === encoded.length / 2) mempool.add(tx, chain.tipState);
-    } catch {
-      // Untrusted helper data is ignored; only locally validated transactions
-      // are admitted to the template.
+  try {
+    const pending = await firstJson<{ txs: string[] }>(helpers, '/mempool');
+    mempool.clear();
+    for (const encoded of pending.txs) {
+      try {
+        const { tx, next } = decodeTx(hexToBytes(encoded));
+        if (next === encoded.length / 2) mempool.add(tx, chain.tipState);
+      } catch {
+        // Untrusted helper data is ignored; only locally validated transactions
+        // are admitted to the template.
+      }
     }
+  } catch (error) {
+    console.warn(
+      `[miner] mempool refresh skipped: ${error instanceof Error ? error.message : String(error)}`,
+    );
   }
 }
 
